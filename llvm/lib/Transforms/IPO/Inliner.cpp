@@ -864,6 +864,11 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
     while (!Calls.empty() && Calls.front().first->getCaller() == &F) {
       auto P = Calls.pop();
       CallBase *CB = P.first;
+
+      if (!FAM.getResult<DominatorTreeAnalysis>(F).isReachableFromEntry(
+              CB->getParent()))
+        continue;
+
       const int InlineHistoryID = P.second;
       Function &Callee = *CB->getCalledFunction();
 
@@ -997,6 +1002,7 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
           DeadFunctionsInComdats.push_back(&Callee);
         }
       }
+      FAM.invalidate(F, PreservedAnalyses::none());
       if (CalleeWasDeleted)
         Advice->recordInliningWithCalleeDeleted();
       else
@@ -1051,10 +1057,6 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
       UR.InlinedInternalEdges.insert({&N, OldC});
     }
     InlinedCallees.clear();
-
-    // Invalidate analyses for this function now so that we don't have to
-    // invalidate analyses for all functions in this SCC later.
-    FAM.invalidate(F, PreservedAnalyses::none());
   }
 
   // We must ensure that we only delete functions with comdats if every function
