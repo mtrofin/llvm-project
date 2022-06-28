@@ -40,6 +40,7 @@
 #include "llvm/CodeGen/GCMetadata.h"
 #include "llvm/CodeGen/GCMetadataPrinter.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineConstantPool.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
@@ -126,6 +127,8 @@
 using namespace llvm;
 
 #define DEBUG_TYPE "asm-printer"
+
+static cl::opt<bool> CalculateInlReward("calc-inl-reward", cl::init(false));
 
 const char DWARFGroupName[] = "dwarf";
 const char DWARFGroupDescription[] = "DWARF Emission";
@@ -425,6 +428,7 @@ void AsmPrinter::getAnalysisUsage(AnalysisUsage &AU) const {
   MachineFunctionPass::getAnalysisUsage(AU);
   AU.addRequired<MachineOptimizationRemarkEmitterPass>();
   AU.addRequired<GCModuleInfo>();
+  AU.addRequired<MachineBlockFrequencyInfo>();
 }
 
 bool AsmPrinter::doInitialization(Module &M) {
@@ -1411,6 +1415,11 @@ static bool needFuncLabelsForEHOrDebugInfo(const MachineFunction &MF) {
 /// EmitFunctionBody - This method emits the body and trailer for a
 /// function.
 void AsmPrinter::emitFunctionBody() {
+  std::string FName = MF->getFunction().getName().str();
+  std::vector<BlockDesc> &BlockDescs = BlockDescriptors[FName];
+  if (!MF->getFunction().hasLocalLinkage())
+    Entrypoints.push_back(FName);
+
   emitFunctionHeader();
 
   // Emit target-specific gunk before the function body.
@@ -1541,9 +1550,29 @@ void AsmPrinter::emitFunctionBody() {
     // We must emit temporary symbol for the end of this basic block, if either
     // we have BBLabels enabled or if this basic blocks marks the end of a
     // section.
-    if (MF->hasBBLabels() ||
+    if (CalculateInlReward || MF->hasBBLabels() ||
         (MAI->hasDotTypeDotSizeDirective() && MBB.isEndSection()))
       OutStreamer->emitLabel(MBB.getEndSymbol());
+
+    if (CalculateInlReward) {
+      const MCExpr *Size = MCBinaryExpr::createSub(
+          MCSymbolRefExpr::create(MBB.getEndSymbol(), OutContext),
+          MCSymbolRefExpr::create(MBB.getSymbol(), OutContext), OutContext);
+      std::vector<std::string> Calls;
+      if (const auto *BB = MBB.getBasicBlock()) {
+        for (const auto &I : *BB)
+          if (const auto *CB = dyn_cast<CallBase>(&I))
+            if (const auto *CF = CB->getCalledFunction())
+              if (!CF->isDeclaration() && !CF->isIntrinsic())
+                Calls.push_back(CF->getName().str());
+
+        // FIXME: alternative way to estimate latency.
+        size_t BlockLatency = MBB.size();
+        BlockDescs.emplace_back(Size, BlockLatency, std::move(Calls),
+                                getAnalysis<MachineBlockFrequencyInfo>()
+                                    .getBlockFreqRelativeToEntryBlock(&MBB));
+      }
+    }
 
     if (MBB.isEndSection()) {
       // The size directive for the section containing the entry block is
@@ -2135,12 +2164,124 @@ bool AsmPrinter::doFinalization(Module &M) {
   MMI = nullptr;
   AddrLabelSymbols = nullptr;
 
+  if (CalculateInlReward) {
+    // We output a succession of: function name, followed by a comma, followed
+    // by the reward, followed by a comma, and then the next function, etc.
+    auto *DS = OutStreamer->getContext().getELFNamedSection(
+        ".llvm_block_data", "", ELF::SHT_NOTE, ELF::SHF_STRINGS);
+    OutStreamer->switchSection(DS);
+    bool OldUseForParsing = OutStreamer->getUseAssemblerInfoForParsing();
+    OutStreamer->setUseAssemblerInfoForParsing(true);
+    for (const auto &E : Entrypoints) {
+      const auto R = getCGReward(E);
+      OutStreamer->emitBytes(E);
+      OutStreamer->emitBytes(",");
+      OutStreamer->emitULEB128Value(R.IWS);
+      OutStreamer->emitULEB128IntValue(static_cast<int64_t>(R.Latency));
+    }
+    OutStreamer->setUseAssemblerInfoForParsing(OldUseForParsing);
+  }
+
   OutStreamer->finish();
   OutStreamer->reset();
   OwnedMLI.reset();
   OwnedMDT.reset();
 
   return false;
+}
+
+// Outputting float MCExpr values is not supported, so, instead, we convert
+// float probabilities to an integer.
+int64_t getIntegralProbability(float P) {
+  return static_cast<int64_t>(100.0 * P);
+}
+
+// For a call graph starting at FName, for each function in the transitive
+// closure, we add its IWS weighed by the probability of its execution.
+// The entrypoint function (FName) has probability 1 (by convention).
+// Other functions have their probability as the sum of probabilities of paths
+// reaching them.
+// The probability along a path is calculated by multiplying the probabilities
+// of call sites.
+const AsmPrinter::Reward AsmPrinter::getCGReward(const std::string &FName) {
+  std::map<std::string, float> FunctionFrequencies;
+
+  // We perform a depth-first traversal and accummulate a function's probability
+  // to be executed.
+  std::set<std::string> CurrentPath;
+  struct Workitem {
+    // Name of function to work on.
+    std::string Name;
+    // The frequency, on the current path, of executing the function.
+
+    float Freq = 0.0;
+    // Indication that we explored the current path below here, and we should
+    // be able to reconsider this function if we arrive to it via some other
+    // path.
+    bool RemoveFromPath = false;
+  };
+
+  std::stack<Workitem> Work;
+  Work.push({FName, 1.0, false});
+
+  while (!Work.empty()) {
+    auto &WI = Work.top();
+    if (WI.RemoveFromPath) {
+      CurrentPath.erase(WI.Name);
+      Work.pop();
+      continue;
+    }
+    WI.RemoveFromPath = true;
+    CurrentPath.insert(WI.Name);
+    FunctionFrequencies[WI.Name] += WI.Freq;
+    for (auto &B : BlockDescriptors[WI.Name])
+      for (auto &C : B.InternalCalls)
+        if (CurrentPath.find(C) == CurrentPath.end())
+          Work.push({C, B.Freq * WI.Freq, false});
+  }
+  // Now aggregate the CG IWS and latency.
+  const MCExpr *RetIWS = nullptr;
+  float Latency = 0.0;
+  for (const auto &P : FunctionFrequencies) {
+    if (P.second == 0)
+      continue;
+    auto FR = getFunctionReward(P.first);
+    int64_t IntegralProb = getIntegralProbability(std::min(1.0f, P.second));
+    const MCExpr *WFIWS = MCBinaryExpr::createMul(
+        FR.IWS, MCConstantExpr::create(IntegralProb, OutContext), OutContext);
+    Latency += FR.Latency * P.second;
+    if (!RetIWS)
+      RetIWS = WFIWS;
+    else
+      RetIWS = MCBinaryExpr::createAdd(RetIWS, WFIWS, OutContext);
+  }
+  return Reward(RetIWS, Latency);
+}
+
+// For a function, we just traverse the BBs and add their size weighed by their
+// probability to be executed.
+const AsmPrinter::Reward
+AsmPrinter::getFunctionReward(const std::string &FName) {
+  auto I = CalculatedRewards.insert(std::make_pair(FName, Reward()));
+  if (!I.second)
+    return I.first->second;
+
+  float Latency = 0.0;
+  const MCExpr *Prob = nullptr;
+  for (const auto &BD : BlockDescriptors[FName]) {
+    float BlockLoadProb = std::min(BD.Freq, 1.0f);
+    int64_t IntegralProb = getIntegralProbability(BlockLoadProb);
+    const auto *BP = MCBinaryExpr::createMul(
+        BD.SizeExp, MCConstantExpr::create(IntegralProb, OutContext),
+        OutContext);
+    Latency += BD.Latency * BD.Freq;
+    if (!Prob)
+      Prob = BP;
+    else
+      Prob = MCBinaryExpr::createAdd(BP, Prob, OutContext);
+  }
+  I.first->second = AsmPrinter::Reward(Prob, Latency);
+  return I.first->second;
 }
 
 MCSymbol *AsmPrinter::getMBBExceptionSym(const MachineBasicBlock &MBB) {
@@ -3557,6 +3698,10 @@ void AsmPrinter::emitVisibility(MCSymbol *Sym, unsigned Visibility,
 
 bool AsmPrinter::shouldEmitLabelForBasicBlock(
     const MachineBasicBlock &MBB) const {
+  // If we calculate the inlining reward, we want labels for each basic block,
+  // so we may evaluate the basic blocks' size.
+  if (CalculateInlReward)
+    return true;
   // With `-fbasic-block-sections=`, a label is needed for every non-entry block
   // in the labels mode (option `=labels`) and every section beginning in the
   // sections mode (`=all` and `=list=`).

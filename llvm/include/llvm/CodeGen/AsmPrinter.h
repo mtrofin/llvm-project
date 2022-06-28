@@ -796,6 +796,50 @@ private:
   mutable unsigned LastFn = 0;
   mutable unsigned Counter = ~0U;
 
+  // ASM printing is a function pass. So we won't have at any point in time
+  // all the functions available to extract size expressions, so we need to
+  // wait to doFinalize, but at that point, IR is missing. So we extract what
+  // we need in the function pass part.
+  // To that end, BlockDesc captures necessary basic block info: the expression
+  // evaluating its size; a measure of its latency; the list of statically-known
+  // calls to module-internal functions (identified by name); and the frequency
+  // relative to the function entry block.
+  struct BlockDesc {
+    BlockDesc(const MCExpr *SizeExp, size_t Latency,
+              std::vector<std::string> &&InternalCalls, float Freq)
+        : SizeExp(SizeExp), Latency(Latency), InternalCalls(InternalCalls),
+          Freq(Freq) {}
+
+    const MCExpr *const SizeExp;
+    const size_t Latency;
+    const std::vector<std::string> InternalCalls;
+    const float Freq;
+  };
+
+  /// The reward has 2 components: IWS - a measure of icache pressure; and
+  /// latency.
+  struct Reward {
+    Reward() = default;
+    Reward(const MCExpr *IWS, float Latency) : IWS(IWS), Latency(Latency) {}
+
+    const MCExpr *IWS = nullptr;
+    float Latency = 0.0f;
+  };
+
+  // BlockDescriptors stores, for each function (identified by name) the
+  // BlockDescs for its basic blocks.
+  // Since BlockDescs point to called functions by name, BlockDescriptors
+  // captures the static call graph (within a module).
+  std::map<std::string, std::vector<BlockDesc>> BlockDescriptors;
+  // This is the list of functions that may be called from outside the module.
+  // We want to compute rewards only relative to these.
+  std::vector<std::string> Entrypoints;
+
+  const Reward getFunctionReward(const std::string &FName);
+  const Reward getCGReward(const std::string &FName);
+
+  std::map<std::string, Reward> CalculatedRewards;
+
   /// This method emits the header for the current function.
   virtual void emitFunctionHeader();
 
