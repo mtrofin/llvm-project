@@ -1,4 +1,4 @@
-; RUN: opt -passes=jump-threading -S < %s | FileCheck %s
+; RUN: opt -passes="require<branch-prob>,jump-threading" -S < %s | FileCheck %s
 define void @test() {
 bb:
   %tmp = call i32 @a()
