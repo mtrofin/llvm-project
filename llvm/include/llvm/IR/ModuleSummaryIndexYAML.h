@@ -268,7 +268,7 @@ template <> struct CustomMappingTraits<GlobalValueSummaryMapTy> {
           std::vector<uint64_t> Refs;
           Refs.reserve(FSum->refs().size());
           for (auto &VI : FSum->refs())
-            Refs.push_back(VI.getGUID());
+             Refs.push_back(VI.getGUID());
           GVSums.push_back(GlobalValueSummaryYaml{
               FSum->flags().Linkage, FSum->flags().Visibility,
               static_cast<bool>(FSum->flags().NotEligibleToImport),
@@ -327,6 +327,23 @@ template <> struct CustomMappingTraits<TypeIdSummaryMapTy> {
   }
 };
 
+template<> struct MappingTraits<std::pair<StringRef, GlobalValue::GUID>> {
+  static void mapping(IO &io, std::pair<StringRef, GlobalValue::GUID>& NameAndGUID) {
+    io.mapRequired("Name", NameAndGUID.first);
+    io.mapRequired("GUID", NameAndGUID.second);
+  }
+};
+
+using StringAndGUID = std::pair<llvm::StringRef, llvm::GlobalValue::GUID>;
+
+} // End yaml namespace
+} // End llvm namespace
+
+LLVM_YAML_IS_SEQUENCE_VECTOR(llvm::yaml::StringAndGUID)
+
+namespace llvm {
+namespace yaml {
+
 template <> struct MappingTraits<ModuleSummaryIndex> {
   static void mapping(IO &io, ModuleSummaryIndex& index) {
     io.mapOptional("GlobalValueMap", index.GlobalValueMap);
@@ -352,20 +369,20 @@ template <> struct MappingTraits<ModuleSummaryIndex> {
                    index.WithGlobalValueDeadStripping);
 
     if (io.outputting()) {
-      auto CfiFunctionDefs = index.CfiFunctionDefs.symbols();
-      llvm::sort(CfiFunctionDefs);
+      auto CfiFunctionDefs = index.CfiFunctionDefs.getSortedSymbols();
       io.mapOptional("CfiFunctionDefs", CfiFunctionDefs);
-      auto CfiFunctionDecls(index.CfiFunctionDecls.symbols());
-      llvm::sort(CfiFunctionDecls);
+      auto CfiFunctionDecls(index.CfiFunctionDecls.getSortedSymbols());
       io.mapOptional("CfiFunctionDecls", CfiFunctionDecls);
     } else {
-      std::vector<std::string> CfiFunctionDefs;
+      std::vector<std::pair<StringRef, GlobalValue::GUID>> CfiFunctionDefs;
       io.mapOptional("CfiFunctionDefs", CfiFunctionDefs);
-      index.CfiFunctionDefs = {CfiFunctionDefs.begin(), CfiFunctionDefs.end()};
-      std::vector<std::string> CfiFunctionDecls;
+      for (auto &[S, G]: CfiFunctionDefs)
+        index.CfiFunctionDefs.addSymbolWithThinLTOGUID(S, G);
+      std::vector<std::pair<StringRef, GlobalValue::GUID>> CfiFunctionDecls;
       io.mapOptional("CfiFunctionDecls", CfiFunctionDecls);
-      index.CfiFunctionDecls = {CfiFunctionDecls.begin(),
-                                CfiFunctionDecls.end()};
+      for (auto &[S, G]: CfiFunctionDecls)
+        index.CfiFunctionDecls.addSymbolWithThinLTOGUID(S, G);
+      ;
     }
   }
 };

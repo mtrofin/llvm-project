@@ -436,6 +436,8 @@ void splitAndWriteThinLTOBitcode(
       Linkage = CFL_Declaration;
     Elts.push_back(ConstantAsMetadata::get(
         llvm::ConstantInt::get(Type::getInt8Ty(Ctx), Linkage)));
+    Elts.push_back(ConstantAsMetadata::get(
+        llvm::ConstantInt::get(Type::getInt64Ty(Ctx), V->getGUID())));
     append_range(Elts, Types);
     CfiFunctionMDs.push_back(MDTuple::get(Ctx, Elts));
   }
