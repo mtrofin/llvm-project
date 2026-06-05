@@ -198,6 +198,8 @@ void simplifyExternals(Module &M) {
                                            AttributeList::FunctionIndex,
                                            F.getAttributes().getFnAttrs()));
     NewF->takeName(&F);
+    NewF->setMetadata(LLVMContext::MD_unique_id,
+                      F.getMetadata(LLVMContext::MD_unique_id));
     F.replaceAllUsesWith(NewF);
     F.eraseFromParent();
   }
@@ -436,9 +438,7 @@ void splitAndWriteThinLTOBitcode(
       Linkage = CFL_Declaration;
     Elts.push_back(ConstantAsMetadata::get(
         llvm::ConstantInt::get(Type::getInt8Ty(Ctx), Linkage)));
-    // TODO: use F->getGUID() once #184065 is relanded.
-    GlobalValue::GUID GUID = GlobalValue::getGUIDAssumingExternalLinkage(
-        GlobalValue::dropLLVMManglingEscape(V->getName()));
+    GlobalValue::GUID GUID = V->getGUID();
     Elts.push_back(ConstantAsMetadata::get(
         llvm::ConstantInt::get(Type::getInt64Ty(Ctx), GUID)));
     append_range(Elts, Types);
