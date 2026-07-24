@@ -1199,9 +1199,14 @@ LTO::addThinLTO(BitcodeModule BM, ArrayRef<InputFile::Symbol> Syms,
           ThinLTO.CombinedIndex, BMID,
           [&](StringRef Name) { return (Prevailing.count(Name) > 0); },
           [&](ValueInfo VI) {
-            auto IT = IRSpecifiedGUIDs.insert({VI.name(), VI.getGUID()});
-            (void)IT;
-            assert(IT.second);
+            if (GlobalValue::getGUIDAssumingExternalLinkage(
+                    GlobalValue::getGlobalIdentifier(
+                        VI.name(), GlobalValue::ExternalLinkage, "")) !=
+                VI.getGUID()) {
+              auto IT = IRSpecifiedGUIDs.insert({VI.name(), VI.getGUID()});
+              (void)IT;
+              assert(IT.second);
+            }
             if (auto GRIt = GlobalResolutions->find(VI.name());
                 GRIt != GlobalResolutions->end() &&
                 Prevailing.count(VI.name())) {
